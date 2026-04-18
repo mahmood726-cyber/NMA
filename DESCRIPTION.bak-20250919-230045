@@ -1,0 +1,45 @@
+Package: surroNMA
+Type: Package
+Title: Advanced Surrogate-Assisted Network Meta-Analysis with Inconsistency, SI, STE, Survival Hooks, HTA Reporting, and GUI
+Version: 1.0.0
+Authors@R: c(person(given = "Mahmood", family = "Ahmad", role = c("aut","cre"),
+                    email = "mahmood726@gmail.com"))
+Author: Mahmood Ahmad [aut, cre]
+Maintainer: Mahmood Ahmad <mahmood726@gmail.com>
+Description: A single-file-first implementation of surrogate-assisted network meta-analysis (NMA)
+    that supports multi-surrogate indices (SI), surrogate threshold effect (STE), inconsistency checks,
+    frequentist quick mode, Bayesian CmdStan models, rankograms, CINeMA exports, stress testing,
+    basic GUIs, and report generation. This package wraps the provided script into an R package
+    structure ready for R CMD build/check and CRAN-like workflows.
+License: MIT + file LICENSE
+Encoding: UTF-8
+LazyData: true
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.3
+Depends: R (>= 4.1)
+Imports:
+    stats,
+    utils,
+    graphics,
+    methods,
+    MASS
+Suggests:
+    Matrix,
+    igraph,
+    ggplot2,
+    glmnet,
+    pls,
+    sl3,
+    data.table,
+    cmdstanr,
+    posterior,
+    rmarkdown,
+    knitr,
+    gWidgets2,
+    gWidgets2RGtk2,
+    tcltk,
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3
+VignetteBuilder: knitr
+URL: https://github.com/mahmood726-cyber/surroNMA/
+SystemRequirements: CmdStan (for Bayesian features via 'cmdstanr').

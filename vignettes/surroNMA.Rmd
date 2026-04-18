@@ -1,0 +1,24 @@
+---
+title: "surroNMA: Surrogate-Assisted NMA"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{surroNMA: Surrogate-Assisted NMA}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```r
+library(surroNMA)
+
+df <- simulate_surro_data(K = 5, J = 10, per_study = 1)
+net <- surro_network(df, study=study, trt=trt, comp=comp,
+                     S_eff=logHR_S, S_se=se_S, T_eff=logHR_T, T_se=se_T, class=class)
+
+# Frequentist quick mode
+fit_f <- surro_nma(net, engine = "freq", B = 50)
+summarize_treatments(fit_f)
+
+# Optional Bayesian (requires cmdstanr + CmdStan)
+# fit_b <- surro_nma(net, engine = "bayes", bayes_method = "mcmc", iter_sampling = 500)
+# summarize_treatments(fit_b)
+```

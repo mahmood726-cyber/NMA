@@ -1,0 +1,11 @@
+^tools$
+^.*[.]bak
+^.*backup
+^.*autobak
+^.*pre-bracefix
+^NAMESPACE[.]backup$
+^.*[.]Rproj$
+^\.Rhistory$
+^\.Rprofile$
+^\.DS_Store$
+^cran-comments[.]md$

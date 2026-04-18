@@ -1,0 +1,3881 @@
+#' @keywords meta-analysis, network meta-analysis, surrogate
+#' @name surroNMA
+#' @importFrom stats ave coef na.omit setNames var cov quantile rnorm rchisq pnorm
+#' @importFrom utils flush.console write.csv getFromNamespace
+"_PACKAGE"
+NULL
+
+utils::globalVariables(c(
+  "S_eff","S_se","S_multi","S_multi_se",
+  "T_eff","T_se","corr_ST","class","baseline_risk","rob"
+))
+
+
+
+
+
+
+.norm_colname <- function(expr) {
+
+
+  # accept bare symbol, name, or quoted string
+
+
+  if (is.character(expr) && length(expr)==1) return(expr)
+
+
+  nm <- tryCatch(deparse(substitute(expr)), error = function(e) NA_character_)
+
+
+  if (!is.na(nm)) {
+
+
+    nm <- sub('^"(.*)"$', '\\1', nm)
+
+
+    nm <- sub("^'(.*)'$", "\\1", nm)
+
+
+    return(nm)
+
+
+  }
+
+#' @keywords meta-analysis, network meta-analysis, surrogate
+
+  stop("Could not resolve column name from argument")
+
+
+}
+
+
+.get_col <- function(df, expr, allow_null = FALSE) {
+
+
+  if (is.null(expr)) { if (allow_null) return(NULL) else stop("Required column not specified") }
+
+
+  nm <- .norm_colname(expr)
+
+
+  if (!nzchar(nm)) stop("Empty column name")
+
+
+  if (!nm %in% names(df)) stop("Column not found in data: ", nm)
+
+
+  df[[nm]]
+
+
+}
+
+
+
+
+
+
+
+
+# internal: resolve a column from data even if the user passed "col" as a string
+
+
+.get_col <- function(df, expr) {
+
+
+  nm <- deparse(substitute(expr))
+
+
+  nm <- sub('^"(.*)"$', '\\1', nm)
+
+
+  nm <- sub("^'(.*)'$", "\\1", nm)
+
+
+  df[[nm]]
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+#' surroNMA v1.0 (single-file core)
+
+
+#' Advanced Surrogate NMA with Inconsistency, SI, STE, VI, Survival hooks, HTA reporting, and GUI
+
+
+#' @keywords meta-analysis, network meta-analysis, surrogate
+
+
+#' @name surroNMA
+
+
+NULL
+
+
+
+
+
+# ---------------- Small utilities ----------------
+
+
+.suro_require <- function(pkgs, quietly = TRUE) {
+
+
+  miss <- pkgs[!vapply(pkgs, requireNamespace, quietly = quietly, FUN.VALUE = logical(1))]
+
+
+  if (length(miss)) {
+
+
+    message("The following packages are suggested but not installed: ",
+
+
+            paste(miss, collapse = ", "),
+
+
+            "\nInstall them via install.packages(...) (or tools::pak()) as needed.")
+
+
+    return(invisible(FALSE))
+
+
+  }
+
+
+  invisible(TRUE)
+
+
+}
+
+
+
+
+
+cmdstan_check <- function() {
+
+
+  if (!requireNamespace("cmdstanr", quietly = TRUE)) return(FALSE)
+
+
+  cs <- try(cmdstanr::cmdstan_version(), silent = TRUE)
+
+
+  isTRUE(!inherits(cs, "try-error"))
+
+
+}
+
+
+
+
+
+#' Help for CmdStan setup
+
+
+#' @export
+
+
+help_cmdstan_setup <- function() {
+
+
+  cat(
+
+
+    "--- CmdStan / cmdstanr setup ---
+
+
+install.packages('cmdstanr', repos = c('https://mc-stan.org/r-packages/', getOption('repos')))
+
+
+cmdstanr::install_cmdstan()   # one-time, compilers required
+
+
+--------------------------------\n")
+
+
+}
+
+
+
+
+
+.invlogit <- function(x) 1/(1+exp(-x))
+
+
+
+
+
+.mvrnorm_chol <- function(n, mu, Sigma) {
+
+
+  if (!.suro_require("Matrix")) {
+
+
+    ev <- eigen(Sigma, symmetric = TRUE)
+
+
+    ev$values[ev$values < 1e-12] <- 1e-12
+
+
+    A <- ev$vectors %*% diag(sqrt(ev$values), nrow(Sigma)) %*% t(ev$vectors)
+
+
+    Z <- matrix(stats::rnorm(n*length(mu)), n)
+
+
+    sweep(Z %*% t(A), 2, mu, `+`)
+
+
+  } else {
+
+
+    near <- try(Matrix::nearPD(Sigma, corr = FALSE), silent = TRUE)
+
+
+    S <- if (inherits(near, "try-error")) Sigma else as.matrix(near$mat)
+
+
+    z <- matrix(stats::rnorm(n*length(mu)), n)
+
+
+    R <- try(chol(S), silent=TRUE)
+
+
+    if (inherits(R, "try-error")) {
+
+
+      ev <- eigen(S, symmetric = TRUE)
+
+
+      ev$values[ev$values < 1e-12] <- 1e-12
+
+
+      A <- ev$vectors %*% diag(sqrt(ev$values), nrow(S)) %*% t(ev$vectors)
+
+
+      return(sweep(z %*% t(A), 2, mu, `+`))
+
+
+    }
+
+
+    sweep(z %*% R, 2, mu, `+`)
+
+
+  }
+
+
+}
+
+
+
+
+
+# ---------------- Data constructor ----------------
+
+
+#' Build a surrogate network object.
+
+
+#' @export
+
+
+surro_network <- function(
+
+
+    data,
+
+
+    study, trt, comp,
+
+
+    S_eff = NULL, S_se = NULL,
+
+
+    T_eff = NULL, T_se = NULL,
+
+
+    S_multi = NULL, S_multi_se = NULL,
+
+
+    corr_ST = NULL,
+
+
+    class = NULL,
+
+
+    baseline_risk = NULL,
+
+
+    rob = NULL,
+
+
+    treatment_info = NULL,
+
+
+    assume_corr_ST = 0.0,
+
+
+    check_connectivity = TRUE
+
+
+) {
+
+
+  # decide pathway by presence of args (not their captured values):
+
+
+  has_uni   <- !missing(S_eff) && !missing(S_se)
+
+
+  has_multi <- !missing(S_multi)
+
+
+  if (!has_uni && !has_multi) {
+
+
+    stop("Provide either S_eff/S_se (univariate)")
+
+
+  }
+
+
+  df <- as.data.frame(data)
+
+
+  study_id <- .get_col(df, study)
+
+
+  A <- .get_col(df, trt)
+
+
+  B <- .get_col(df, comp)
+
+
+  Se <- if (!missing(S_eff)) .get_col(df, S_eff) else NULL
+
+
+  Ss <- if (!missing(S_se))  .get_col(df, S_se)  else NULL
+
+
+  Te <- if (!missing(T_eff)) .get_col(df, T_eff) else NULL
+
+
+  Ts <- if (!missing(T_se))  .get_col(df, T_se)  else NULL
+
+
+  Corr <- if (!missing(corr_ST)) .get_col(df, corr_ST) else NULL
+
+
+  ClsRow <- if (!missing(class)) .get_col(df, class) else NULL
+
+
+  BaseRisk <- if (!missing(baseline_risk)) .get_col(df, baseline_risk) else NULL
+
+
+  RoB <- if (!missing(rob)) .get_col(df, rob) else NULL
+
+
+
+
+
+  if (is.null(A) || is.null(B) || is.null(study_id))
+
+
+    stop("Required columns are missing (study/trt/comp)")
+
+
+  if (missing(S_multi) && (missing(S_eff) || missing(S_se)))
+
+
+    stop("Provide either S_eff/S_se (univariate) or S_multi (multivariate surrogates).")
+
+
+  if (!is.null(Se) && is.null(Ss)) stop("S_se required when S_eff given.")
+
+
+  if (!is.null(Te) && is.null(Ts)) stop("T_se required when T_eff given.")
+
+
+  if (!is.null(Se) && any(!is.finite(Se) | !is.finite(Ss))) stop("Non-finite S_eff/S_se.")
+
+
+  if (!is.null(Te) && any(!is.finite(Te) | !is.finite(Ts))) warning("Some T rows missing; allowed.")
+
+
+
+
+
+  trts <- sort(unique(c(A, B)))
+
+
+  K <- length(trts)
+
+
+  map <- setNames(seq_len(K), trts)
+
+
+  a <- as.integer(map[as.character(A)])
+
+
+  b <- as.integer(map[as.character(B)])
+
+
+  J <- length(unique(study_id))
+
+
+
+
+
+  if (!missing(treatment_info)) {
+
+
+    if (!all(c("treatment","class") %in% names(treatment_info)))
+
+
+      stop("treatment_info must have columns: treatment, class")
+
+
+    tinfo <- unique(treatment_info[, c("treatment","class")])
+
+
+    t_class_map <- setNames(tinfo$class, tinfo$treatment)
+
+
+  } else {
+
+
+    t_class_map <- tapply(ClsRow, factor(A, levels=trts), function(x) {
+
+
+      if (all(is.na(x))) NA else names(sort(table(x), decreasing = TRUE))[1]
+
+
+    })
+
+
+    t_class_mapB <- tapply(ClsRow, factor(B, levels=trts), function(x) {
+
+
+      if (all(is.na(x))) NA else names(sort(table(x), decreasing = TRUE))[1]
+
+
+    })
+
+
+    conf <- trts[!is.na(t_class_map) & !is.na(t_class_mapB) & t_class_map != t_class_mapB]
+
+
+    if (length(conf))
+
+
+      message("Note: conflicting class assignments for treatments: ",
+
+
+              paste(conf, collapse=", "),
+
+
+              ". Consider supplying `treatment_info`.")
+
+
+    for (tt in trts) {
+
+
+      if (is.na(t_class_map[[tt]]) && !is.na(t_class_mapB[[tt]])) t_class_map[[tt]] <- t_class_mapB[[tt]]
+
+
+    }
+
+
+  }
+
+
+  classes <- unique(na.omit(unname(t_class_map[trts])))
+
+
+  if (length(classes) == 0) classes <- "all"
+
+
+  G <- length(classes)
+
+
+  class_id <- match(unname(t_class_map[trts]), classes)
+
+
+  class_id[is.na(class_id)] <- 1L
+
+
+
+
+
+  if (check_connectivity && .suro_require("igraph")) {
+
+
+    g <- igraph::graph_from_data_frame(data.frame(A=as.character(A), B=as.character(B)), directed = FALSE)
+
+
+    if (!igraph::is_connected(g)) warning("Network is disconnected; consider analyzing components separately.")
+
+
+  }
+
+
+
+
+
+  Slist <- NULL
+
+
+  if (!missing(S_multi)) {
+
+
+  if (missing(S_multi) && (missing(S_eff) || missing(S_se)))
+
+
+    stop("Provide either S_eff/S_se ((univariate))")
+
+
+    if (!missing(S_multi_se)) {
+
+
+      if (is.matrix(S_multi_se) || is.data.frame(S_multi_se)) {
+
+
+        Sms <- as.matrix(S_multi_se)
+
+
+  if (missing(S_multi) && (missing(S_eff) || missing(S_se)))
+
+
+    stop("Provide either S_eff/S_se ((univariate))")
+
+
+        Sms <- do.call(cbind, S_multi_se)
+
+
+      } else {
+
+
+        stop("S_multi_se must be matrix/data.frame or list with names matching S_multi.")
+
+
+      }
+
+
+    } else {
+
+
+      Sms <- matrix(NA_real_, nrow(Slist), ncol(Slist))
+
+
+    }
+
+
+  }
+
+
+
+
+
+  if (is.null(Corr)) Corr <- rep(assume_corr_ST, length(a))
+
+
+
+
+
+  list(
+
+
+    data = df,
+
+
+    study = study_id,
+
+
+    trt = a, comp = b,
+
+
+    trt_levels = trts,
+
+
+    K = K, J = J,
+
+
+    S_eff = Se, S_se = Ss,
+
+
+    T_eff = Te, T_se = Ts,
+
+
+    S_multi = Slist, S_multi_se = if (exists("Sms")) Sms else NULL,
+
+
+    corr_ST = Corr,
+
+
+    classes = classes,
+
+
+    G = G,
+
+
+    class_id = class_id,
+
+
+    class_map = setNames(seq_len(G), classes),
+
+
+    trt_class_id = class_id,
+
+
+    baseline_risk = BaseRisk,
+
+
+    rob = RoB
+
+
+  )
+
+
+}
+
+
+
+
+
+# ---------------- Surrogate Index ----------------
+
+
+#' Train a surrogate index from multiple surrogates
+
+
+#' @export
+
+
+surro_index_train <- function(net, method = c("ols","ridge","pcr","sl3"),
+
+
+                              zscore = TRUE, seed = 1, sl3_learners = NULL, kfold = 5) {
+
+
+  method <- match.arg(method)
+
+
+  if (missing(S_multi) && (missing(S_eff) || missing(S_se)))
+
+
+    stop("Provide either S_eff/S_se ((univariate))")
+
+
+  colnames(S) <- paste0("S", seq_len(ncol(S)))
+
+
+  T <- net$T_eff
+
+
+  ok <- which(is.finite(T) & rowSums(is.finite(S)) == ncol(S))
+
+
+  if (!length(ok)) stop("No complete cases for SI training.")
+
+
+  S <- S[ok, , drop=FALSE]
+
+
+  T <- T[ok]
+
+
+  if (zscore) {
+
+
+    S <- as.data.frame(scale(S))
+
+
+    T <- as.numeric(scale(T))
+
+
+  }
+
+
+  set.seed(seed)
+
+
+  res <- list(method = method, zscore = zscore, colnames = colnames(S))
+
+
+  if (method == "ols") {
+
+
+    m <- stats::lm(T ~ . , data = S)
+
+
+    res$fit <- m
+
+
+    res$coef <- stats::coef(m)
+
+
+    res$cv_r2 <- NA_real_
+
+
+  } else if (method == "ridge") {
+
+
+    .suro_require(c("glmnet"))
+
+
+    x <- as.matrix(S); y <- as.numeric(T)
+
+
+    cv <- glmnet::cv.glmnet(x, y, alpha = 0)
+
+
+    fit <- glmnet::glmnet(x, y, alpha = 0, lambda = cv$lambda.min)
+
+
+    res$fit <- fit
+
+
+    res$lambda <- cv$lambda.min
+
+
+    res$coef <- as.numeric(coef(fit))
+
+
+    names(res$coef) <- c("(Intercept)", colnames(S))
+
+
+    res$cv_r2 <- max(0, 1 - min(cv$cvm, na.rm = TRUE)/stats::var(y))
+
+
+  } else if (method == "pcr") {
+
+
+    .suro_require(c("pls"))
+
+
+    m <- pls::pcr(T ~ ., data = S, validation = "CV")
+
+
+    vn <- which.min(m$validation$PRESS)
+
+
+    res$fit <- m
+
+
+    res$ncomp <- vn
+
+
+    yhat <- stats::predict(m, ncomp = vn, newdata = S)[,1,1]
+
+
+    res$cv_r2 <- max(0, 1 - mean((T - yhat)^2, na.rm = TRUE)/stats::var(T, na.rm = TRUE))
+
+
+  } else if (method == "sl3") {
+
+
+    .suro_require(c("sl3","data.table"))
+
+
+    task <- sl3::sl3_Task(data = data.table::as.data.table(cbind(S, T=T)),
+
+
+                          covariates = colnames(S), outcome = "T")
+
+
+    if (is.null(sl3_learners)) {
+
+
+      lrn <- sl3::Lrnr_glm_fast$new()
+
+
+      sl <- sl3::Lrnr_sl$new(learners = list(lrn), metalearner = sl3::Lrnr_nnls$new())
+
+
+    } else {
+
+
+      sl <- sl3_learners
+
+
+    }
+
+
+    fit <- sl$train(task)
+
+
+    yhat <- fit$predict(task)
+
+
+    res$fit <- fit
+
+
+    res$cv_r2 <- max(0, 1 - mean((T - yhat)^2, na.rm = TRUE)/stats::var(T, na.rm = TRUE))
+
+
+  }
+
+
+  class(res) <- "surro_index"
+
+
+  res
+
+
+}
+
+
+
+
+
+#' Apply a trained SI to augment the network
+
+
+#' @export
+
+
+augment_network_with_SI <- function(net, si_model) {
+
+
+  if (missing(S_multi) && (missing(S_eff) || missing(S_se)))
+
+
+    stop("Provide either S_eff/S_se ((univariate))")
+
+
+  colnames(S) <- si_model$colnames
+
+
+  if (isTRUE(si_model$zscore)) {
+
+
+    S <- as.data.frame(scale(S))
+
+
+  }
+
+
+  pred <- switch(si_model$method,
+
+
+                 "ols"   = as.numeric(cbind(1, as.matrix(S)) %*% si_model$coef),
+
+
+                 "ridge" = as.numeric(cbind(1, as.matrix(S)) %*% si_model$coef),
+
+
+                 "pcr"   = as.numeric(stats::predict(si_model$fit, ncomp = si_model$ncomp, newdata = S)[,1,1]),
+
+
+                 "sl3"   = {
+
+
+                   .suro_require("sl3")
+
+
+                   sl3::predict(sl3::Lrnr_base$reconstruct(si_model$fit), newdata = S)
+
+
+                 }
+
+
+  )
+
+
+  SE <- rep(NA_real_, length(pred))
+
+
+  if (!is.null(net$S_multi_se)) {
+
+
+    w <- switch(si_model$method,
+
+
+                "ols"   = si_model$coef[-1],
+
+
+                "ridge" = si_model$coef[-1],
+
+
+                "pcr"   = rep(NA_real_, ncol(S)),
+
+
+                "sl3"   = rep(NA_real_, ncol(S)))
+
+
+    if (all(is.finite(w))) {
+
+
+      vars <- net$S_multi_se^2
+
+
+      SE <- sqrt(rowSums(t(t(vars) * (w^2))))
+
+
+    }
+
+
+  }
+
+
+  net$S_eff <- pred
+
+
+  net$S_se  <- ifelse(is.finite(SE), SE, net$S_se)
+
+
+  attr(net, "has_SI") <- TRUE
+
+
+  net
+
+
+}
+
+
+
+
+
+# ---------------- STE ----------------
+
+
+#' Compute Surrogate Threshold Effect (STE)
+
+
+#' @export
+
+
+compute_STE <- function(draws_alpha, draws_beta, threshold_T = 0.0) {
+
+
+  ste <- (threshold_T - draws_alpha) / draws_beta
+
+
+  stats <- c(mean = mean(ste, na.rm=TRUE),
+
+
+             median = stats::median(ste, na.rm=TRUE),
+
+
+             q025 = stats::quantile(ste, 0.025, na.rm=TRUE),
+
+
+             q975 = stats::quantile(ste, 0.975, na.rm=TRUE))
+
+
+  list(ste = ste, summary = stats)
+
+
+}
+
+
+
+
+
+# ---------------- Ranking helpers ----------------
+
+
+#' @export
+
+
+rank_from_draws <- function(eff_matrix) {
+
+
+  t(apply(eff_matrix, 1, function(x) rank(x, ties.method = "average")))
+
+
+}
+
+
+
+
+
+#' @export
+
+
+sucra <- function(ranks) {
+
+
+  K <- ncol(ranks)
+
+
+  pr <- colMeans(ranks, na.rm = TRUE)
+
+
+  (K - pr) / (K - 1)
+
+
+}
+
+
+
+
+
+#' @export
+
+
+poth <- function(ranks) {
+
+
+  K <- ncol(ranks)
+
+
+  modal_order <- order(colMeans(ranks, na.rm = TRUE))
+
+
+  kendall_dist <- function(order1, order2) {
+
+
+    o1 <- order(order1); o2 <- order(order2)
+
+
+    d <- 0L
+
+
+    for (i in 1:(K-1)) for (j in (i+1):K) {
+
+
+      d <- d + as.integer((o1[i]-o1[j])*(o2[i]-o2[j]) < 0)
+
+
+    }
+
+
+    d
+
+
+  }
+
+
+  dmax <- K*(K-1)/2
+
+
+  dbar <- mean(apply(ranks, 1, function(r) kendall_dist(order(r), modal_order)))
+
+
+  1 - dbar/dmax
+
+
+}
+
+
+
+
+
+#' @export
+
+
+mid_adjusted_preference <- function(eff_matrix, MID = 0) {
+
+
+  K <- ncol(eff_matrix)
+
+
+  ranks <- matrix(NA_real_, nrow(eff_matrix), K)
+
+
+  for (i in seq_len(nrow(eff_matrix))) {
+
+
+    x <- eff_matrix[i,]
+
+
+    wins <- rep(0, K)
+
+
+    for (a in 1:K) for (b in 1:K) if (a != b) {
+
+
+      d <- x[b] - x[a]
+
+
+      if (d > MID) wins[a] <- wins[a] + 1L
+
+
+    }
+
+
+    ranks[i,] <- rank(-wins, ties.method = "average")
+
+
+  }
+
+
+  ranks
+
+
+}
+
+
+
+
+
+# ---------------- Stan code generator ----------------
+
+
+.stan_code_biv <- function(second_order = FALSE, use_t = FALSE, class_specific = TRUE,
+
+
+                           inconsistency = c('none','random'),
+
+
+                           inc_on = c('T','S','both'),
+
+
+                           global_surrogacy = FALSE,
+
+
+                           survival_mode = c('ph','nph_msplines')) {
+
+
+  inconsistency <- match.arg(inconsistency)
+
+
+  inc_on <- match.arg(inc_on)
+
+
+  survival_mode <- match.arg(survival_mode)
+
+
+
+
+
+  append_if <- function(v, cond, s) if (cond) c(v, s) else v
+
+
+
+
+
+  code <- c(
+
+
+    'data{',
+
+
+    'int<lower=2> K;',
+
+
+    'int<lower=1> N;',
+
+
+    'int<lower=1> J;',
+
+
+    'int<lower=1, upper=J> study_id[N];',
+
+
+    'int<lower=1, upper=K> a[N];',
+
+
+    'int<lower=1, upper=K> b[N];',
+
+
+    'vector[N] S_eff;',
+
+
+    'vector<lower=0>[N] S_se;',
+
+
+    'vector[N] T_eff;',
+
+
+    'vector<lower=0>[N] T_se;',
+
+
+    'vector[N] rho_ST;',
+
+
+    'int<lower=0,upper=1> has_T[N];',
+
+
+    'int<lower=1> G;',
+
+
+    'int<lower=1,upper=G> trt_class[K];',
+
+
+    'int<lower=0,upper=1> class_specific;',
+
+
+    'int<lower=0,upper=1> global_surrogacy;',
+
+
+    'real<lower=0> prior_tauS_scale;',
+
+
+    'real<lower=0> prior_tauT_scale;',
+
+
+    'real<lower=0> prior_tauI_scale;',
+
+
+    'real<lower=0> prior_sigma_d_scale;',
+
+
+    '}',
+
+
+    'parameters{',
+
+
+    'vector[K-1] dS_raw;',
+
+
+    'vector[K-1] dT_raw;',
+
+
+    'real alpha0;',
+
+
+    'real beta0;',
+
+
+    'vector[G] alpha_g_raw;',
+
+
+    'vector[G] beta_g_raw;',
+
+
+    'real<lower=0> tauS;',
+
+
+    'real<lower=0> tauT;',
+
+
+    'real<lower=0> sigma_d;'
+
+
+  )
+
+
+  code <- append_if(code, inconsistency != 'none',
+
+
+                    'real<lower=0> tauI_S; real<lower=0> tauI_T;')
+
+
+  code <- c(code,
+
+
+            'vector[J] uS;',
+
+
+            'vector[J] uT;'
+
+
+  )
+
+
+  code <- append_if(code, isTRUE(use_t), 'real<lower=2> nu;')
+
+
+  code <- c(code,
+
+
+            '}',
+
+
+            'transformed parameters{',
+
+
+            'vector[K] dS; vector[K] dT;',
+
+
+            'dS[1] = 0; dT[1] = 0;',
+
+
+            'for (k in 2:K){ dS[k] = dS_raw[k-1]; dT[k] = dT_raw[k-1]; }',
+
+
+            'vector[G] alpha_g; vector[G] beta_g;',
+
+
+            'for (g in 1:G){ alpha_g[g] = alpha0 + alpha_g_raw[g]; beta_g[g] = beta0 + beta_g_raw[g]; }',
+
+
+            '}',
+
+
+            'model{',
+
+
+            'dS_raw ~ normal(0, 1.0);',
+
+
+            'dT_raw ~ normal(0, 1.0);',
+
+
+            'alpha0 ~ normal(0, 2);',
+
+
+            'beta0  ~ normal(0, 1);',
+
+
+            'alpha_g_raw ~ normal(0, 1);',
+
+
+            'beta_g_raw  ~ normal(0, 0.5);',
+
+
+            'tauS ~ normal(0, prior_tauS_scale);',
+
+
+            'tauT ~ normal(0, prior_tauT_scale);',
+
+
+            'sigma_d ~ normal(0, prior_sigma_d_scale);'
+
+
+  )
+
+
+  code <- append_if(code, inconsistency != 'none',
+
+
+                    'tauI_S ~ normal(0, prior_tauI_scale); tauI_T ~ normal(0, prior_tauI_scale);')
+
+
+  code <- c(code,
+
+
+            'uS ~ normal(0, tauS);',
+
+
+            'uT ~ normal(0, tauT);',
+
+
+            'for (i in 1:N){',
+
+
+            '  int j = study_id[i];',
+
+
+            '  real muS = dS[a[i]] - dS[b[i]] + uS[j];'
+
+
+  )
+
+
+  code <- append_if(code, inconsistency != 'none' && inc_on %in% c('S','both'),
+
+
+                    '  muS = muS + normal_rng(0, tauI_S);')
+
+
+  code <- c(code,
+
+
+            '  target += normal_lpdf(S_eff[i] | muS, S_se[i]);',
+
+
+            '  if (has_T[i]==1){',
+
+
+            '    real muT = dT[a[i]] - dT[b[i]] + uT[j];',
+
+
+            '    real alpha = (global_surrogacy==1) ? alpha0 : alpha_g[ trt_class[a[i]] ];',
+
+
+            '    real beta  = (global_surrogacy==1) ? beta0  : beta_g[ trt_class[a[i]] ];',
+
+
+            '    target += normal_lpdf(T_eff[i] | muT, T_se[i]);',
+
+
+            '    target += normal_lpdf( ( (dT[a[i]]-dT[b[i]]) - (alpha + beta * (dS[a[i]]-dS[b[i]]) ) ) | 0, sigma_d );'
+
+
+  )
+
+
+  code <- append_if(code, inconsistency != 'none' && inc_on %in% c('T','both'),
+
+
+                    '    target += normal_lpdf( (T_eff[i] - (dT[a[i]]-dT[b[i]] + uT[j])) | 0, tauI_T );')
+
+
+  code <- c(code,
+
+
+            '  }',
+
+
+            '}',
+
+
+            '}',
+
+
+            'generated quantities{',
+
+
+            'vector[N] muT_pred;',
+
+
+            'for (i in 1:N){',
+
+
+            '  real alpha = (global_surrogacy==1) ? alpha0 : alpha_g[trt_class[a[i]]];',
+
+
+            '  real beta  = (global_surrogacy==1) ? beta0  : beta_g[trt_class[a[i]]];',
+
+
+            '  muT_pred[i] = alpha + beta * (dS[a[i]] - dS[b[i]]);',
+
+
+            '}',
+
+
+            '}'
+
+
+  )
+
+
+  paste(code, collapse = '\n')
+
+
+}
+
+
+
+
+
+# ---------------- Stan data ----------------
+
+
+.make_stan_data <- function(net, priors = list(tauS=0.5, tauT=0.5, tauI=0.2, sigma_d=0.5),
+
+
+                            global_surrogacy = FALSE, class_specific = TRUE) {
+
+
+  df <- net$data
+
+
+  N <- nrow(df)
+
+
+  hasT <- as.integer(is.finite(net$T_eff))
+
+
+  list(
+
+
+    K = net$K,
+
+
+    N = N,
+
+
+    J = length(unique(net$study)),
+
+
+    study_id = as.integer(factor(net$study)),
+
+
+    a = as.integer(net$trt),
+
+
+    b = as.integer(net$comp),
+
+
+    S_eff = ifelse(is.finite(net$S_eff), net$S_eff, 0),
+
+
+    S_se  = ifelse(is.finite(net$S_se),  pmax(net$S_se, 1e-9), 1e6),
+
+
+    T_eff = ifelse(is.finite(net$T_eff), net$T_eff, 0),
+
+
+    T_se  = ifelse(is.finite(net$T_se),  pmax(net$T_se, 1e-9), 1e6),
+
+
+    rho_ST = ifelse(is.finite(net$corr_ST), net$corr_ST, 0),
+
+
+    has_T = hasT,
+
+
+    G = net$G,
+
+
+    trt_class = as.integer(net$trt_class_id),
+
+
+    class_specific = as.integer(class_specific),
+
+
+    global_surrogacy = as.integer(global_surrogacy),
+
+
+    prior_tauS_scale = priors$tauS, prior_tauT_scale=priors$tauT,
+
+
+    prior_tauI_scale = priors$tauI, prior_sigma_d_scale=priors$sigma_d
+
+
+  )
+
+
+}
+
+
+
+
+
+# ---------------- Bayesian fit ----------------
+
+
+# Helpers
+
+
+`%+%` <- function(a,b) paste0(a,b)
+
+
+write_stan_file <- function(code) {
+
+
+  f <- tempfile(fileext = ".stan"); writeLines(code, f); f
+
+
+}
+
+
+
+
+
+#' @export
+
+
+surro_nma_bayes <- function(net,
+
+
+                            inconsistency = c("none","random"),
+
+
+                            inc_on = c("T","S","both"),
+
+
+                            class_specific = TRUE,
+
+
+                            global_surrogacy = FALSE,
+
+
+                            use_t = FALSE,
+
+
+                            survival_mode = c("ph","nph_msplines"),
+
+
+                            iter_warmup = 1000, iter_sampling = 1000, chains = 4,
+
+
+                            adapt_delta = 0.9, max_treedepth = 12,
+
+
+                            bayes_method = c("mcmc","vi"),
+
+
+                            seed = 1, priors = list(tauS=0.5, tauT=0.5, tauI=0.2, sigma_d=0.5)) {
+
+
+  bayes_method <- match.arg(bayes_method)
+
+
+  inconsistency <- match.arg(inconsistency)
+
+
+  inc_on <- match.arg(inc_on)
+
+
+  survival_mode <- match.arg(survival_mode)
+
+
+
+
+
+  if (!cmdstan_check()) {
+
+
+    stop("cmdstanr / CmdStan not found. Run help_cmdstan_setup()")
+
+
+  }
+
+
+  data_stan <- .make_stan_data(net, priors, global_surrogacy=global_surrogacy, class_specific=class_specific)
+
+
+  code <- .stan_code_biv(second_order = FALSE, use_t = use_t, class_specific = class_specific,
+
+
+                         inconsistency = inconsistency, inc_on = inc_on, global_surrogacy = global_surrogacy,
+
+
+                         survival_mode = survival_mode)
+
+
+  mod <- cmdstanr::cmdstan_model(write_stan_file(code))
+
+
+  if (bayes_method == "mcmc") {
+
+
+    fit <- mod$sample(
+
+
+      data = data_stan,
+
+
+      seed = seed, chains = chains,
+
+
+      iter_warmup = iter_warmup, iter_sampling = iter_sampling,
+
+
+      parallel_chains = min(chains, max(1, parallel::detectCores()-1)),
+
+
+      refresh = 100,
+
+
+      adapt_delta = adapt_delta, max_treedepth = max_treedepth
+
+
+    )
+
+
+  } else {
+
+
+    fit <- mod$variational(data = data_stan, seed = seed, iter = 5000, grad_samples = 1, elbo_samples = 50)
+
+
+  }
+
+
+  out <- list(
+
+
+    engine = "bayes",
+
+
+    bayes_method = bayes_method,
+
+
+    inconsistency = inconsistency,
+
+
+    inc_on = inc_on,
+
+
+    class_specific = class_specific,
+
+
+    global_surrogacy = global_surrogacy,
+
+
+    survival_mode = survival_mode,
+
+
+    stan = fit,
+
+
+    net = net
+
+
+  )
+
+
+  class(out) <- "surro_fit"
+
+
+  out
+
+
+}
+
+
+
+
+
+# ---------------- Frequentist quick mode ----------------
+
+
+#' @export
+
+
+surro_nma_freq <- function(net, B = 400, boot = c('normal','student'), df = 5, seed = 1,
+
+
+                           multiarm_adj = TRUE, baseline_risk_mod = !is.null(net$baseline_risk),
+
+
+                           rob_weights = !is.null(net$rob), mid = NULL) {
+
+
+  boot <- match.arg(boot)
+
+
+  set.seed(seed)
+
+
+  dfreq <- net$data
+
+
+  K <- net$K; N <- nrow(dfreq)
+
+
+  ref <- 1L
+
+
+  X <- matrix(0, nrow=N, ncol=K-1)
+
+
+  for (i in 1:N) {
+
+
+    if (net$trt[i] != ref) X[i, net$trt[i]-1] <-  1
+
+
+    if (net$comp[i]!= ref) X[i, net$comp[i]-1] <- -1
+
+
+  }
+
+
+  w_rob <- rep(1, N)
+
+
+  if (rob_weights) {
+
+
+    r <- net$rob
+
+
+    r <- ifelse(is.finite(r), r, 0)
+
+
+    r <- (r - min(r,na.rm=TRUE)) / max(1e-8, diff(range(r,na.rm=TRUE)))
+
+
+    w_rob <- 1 - 0.5*r
+
+
+  }
+
+
+  if (multiarm_adj) {
+
+
+    m_con <- ave(seq_len(N), net$study, FUN = length)
+
+
+    w_ma <- 1/pmax(m_con - 1, 1)
+
+
+  } else w_ma <- 1
+
+
+
+
+
+  yS <- net$S_eff; vS <- net$S_se^2
+  # hotfix16C: fallback if S_eff/S_se not carried through in net
+  if (is.null(yS) && is.list(net) && !is.null(net$data)) {
+    if ("logHR_S" %in% names(net$data)) yS <- net$data$logHR_S
+  }
+  if (is.null(vS) && is.list(net) && !is.null(net$data)) {
+    if ("se_S" %in% names(net$data)) vS <- net$data$se_S^2
+  }
+  # recompute weights if needed
+  if (exists("w_ma") && exists("w_rob") && (is.null(yS) || is.null(vS))) {
+    warning("Surrogate columns missing; frequentist fit may be unstable.")
+  }
+  if (exists("w_ma") && exists("w_rob") && !is.null(vS)) {
+    W_S <- 1/(vS) * w_ma * w_rob
+  }
+
+
+  W_S <- 1/(vS) * w_ma * w_rob
+
+
+  betaS <- try(solve(t(X)%*%(W_S*X), t(X)%*%(W_S*yS)), silent=TRUE)
+
+
+# -- hotfix15: ensure W_S aligns with X and compute XtWX safely --
+
+
+  dS_hat <- c(0, as.numeric(betaS))
+
+
+
+
+
+  obsT <- is.finite(net$T_eff)
+
+
+  XT <- X[obsT,,drop=FALSE]; yT <- net$T_eff[obsT]; vT <- net$T_se[obsT]^2
+
+
+  W_T <- 1/(vT) * w_ma[obsT] * w_rob[obsT]
+
+
+  if (nrow(XT) >= (K-1)) {
+
+
+    betaT <- try(solve(t(XT)%*%(W_T*XT), t(XT)%*%(W_T*yT)), silent=TRUE)
+
+
+    if (inherits(betaT,'try-error')) betaT <- MASS::ginv(t(XT)%*%(W_T*XT)) %*% t(XT)%*%(W_T*yT)
+
+
+  } else {
+
+
+    betaT <- rep(0, K-1)
+
+
+  }
+
+
+  dT_hat <- c(0, as.numeric(betaT))
+
+
+
+
+
+# -- hotfix16B: ensure numeric betaS; compute from X,W_S,Se if needed --
+if (!exists("betaS", inherits = FALSE) ||
+    !is.numeric(betaS) || any(!is.finite(betaS))) {
+  X   <- as.matrix(X); storage.mode(X) <- "double"
+  Se  <- suppressWarnings(as.numeric(yS))
+  W_S <- suppressWarnings(as.numeric(W_S))
+  row_ok <- is.finite(Se) & is.finite(W_S)
+  if (nrow(X) != length(row_ok)) {
+    # try to align by dropping rows where X has non-finite entries
+    row_ok <- row_ok & apply(is.finite(X), 1L, all)
+  }
+  X  <- X[row_ok, , drop = FALSE]
+  Se <- Se[row_ok]
+  W_S <- W_S[row_ok]
+  if (nrow(X) < ncol(X)) stop("hotfix16B: not enough rows for coefficient estimation")
+  wsqrt <- sqrt(W_S)
+  Xw <- X * wsqrt
+  XtWX <- crossprod(Xw, Xw)
+  XtWy <- crossprod(X, W_S * yS)
+  betaS <- as.numeric(MASS::ginv(XtWX) %*% XtWy)
+}
+# -- hotfix16B: ensure numeric betaS; compute from X,W_S,Se if needed --
+if (!exists("betaS", inherits = FALSE) ||
+    !is.numeric(betaS) || any(!is.finite(betaS))) {
+  X   <- as.matrix(X); storage.mode(X) <- "double"
+  Se  <- suppressWarnings(as.numeric(yS))
+  W_S <- suppressWarnings(as.numeric(W_S))
+  row_ok <- is.finite(Se) & is.finite(W_S)
+  if (nrow(X) != length(row_ok)) {
+    # try to align by dropping rows where X has non-finite entries
+    row_ok <- row_ok & apply(is.finite(X), 1L, all)
+  }
+  X  <- X[row_ok, , drop = FALSE]
+  Se <- Se[row_ok]
+  W_S <- W_S[row_ok]
+  if (nrow(X) < ncol(X)) stop("hotfix16B: not enough rows for coefficient estimation")
+  wsqrt <- sqrt(W_S)
+  Xw <- X * wsqrt
+  XtWX <- crossprod(Xw, Xw)
+  XtWy <- crossprod(X, W_S * yS)
+  betaS <- as.numeric(MASS::ginv(XtWX) %*% XtWy)
+}
+  sX  <- (X %*% betaS)
+
+
+  sY  <- ifelse(obsT, (XT %*% betaT), NA_real_)
+
+
+  idx <- which(obsT)
+
+
+  if (length(idx) < 3) warning('Few T-observed rows; frequentist surrogacy uncertain.')
+
+
+  ratio <- mean(vT[is.finite(vT)], na.rm=TRUE) / mean(vS[is.finite(vS)], na.rm=TRUE)
+
+
+
+
+
+  deming <- function(x,y, lambda){
+
+
+    xbar <- mean(x); ybar <- mean(y)
+
+
+    sxx <- stats::var(x); syy <- stats::var(y); sxy <- stats::cov(x,y)
+
+
+    beta <- (syy - lambda*sxx + sqrt((syy - lambda*sxx)^2 + 4*lambda*sxy^2))/(2*sxy)
+
+
+    alpha <- ybar - beta*xbar
+
+
+    c(alpha=alpha, beta=beta)
+
+
+  }
+
+
+  ab <- if (sum(is.finite(sX[idx]) & is.finite(sY)) >= 3) deming(sX[idx], sY, ratio) else c(alpha=0,beta=1)
+
+
+
+
+
+  B <- as.integer(B)
+
+
+  draws_T <- matrix(NA_real_, B, K)
+
+
+  for (b in 1:B) {
+
+
+    eS <- stats::rnorm(N, 0, sqrt(vS))
+
+
+    eT <- stats::rnorm(sum(obsT), 0, sqrt(vT))
+
+
+    if (boot=='student') {
+
+
+      eS <- eS * sqrt(df / stats::rchisq(N, df))
+
+
+      eT <- eT * sqrt(df / stats::rchisq(sum(obsT), df))
+
+
+    }
+
+
+    yS_b <- yS + eS
+
+
+    yT_b <- net$T_eff[obsT] + eT
+
+
+    betaS_b <- try(solve(t(X)%*%(W_S*X), t(X)%*%(W_S*yS_b)), silent=TRUE)
+
+
+W_S <- as.numeric(W_S)
+
+
+    dS_b <- c(0, as.numeric(betaS_b))
+
+
+    XT <- X[obsT,,drop=FALSE]
+
+
+    betaT_b <- try(solve(t(XT)%*%(W_T*XT), t(XT)%*%(W_T*yT_b)), silent=TRUE)
+
+
+    if (inherits(betaT_b,'try-error')) betaT_b <- MASS::ginv(t(XT)%*%(W_T*XT)) %*% t(XT)%*%(W_T*yT_b)
+
+
+    dT_b <- c(0, as.numeric(betaT_b))
+
+
+    dT_sur <- (ab['alpha'] + ab['beta'] * dS_b)
+
+
+    draws_T[b, ] <- dT_sur
+
+
+  }
+
+
+  ranks <- rank_from_draws(draws_T)
+
+
+  out <- list(
+
+
+    engine = 'freq',
+
+
+    net = net,
+
+
+    dS = dS_hat, dT = dT_hat,
+
+
+    deming = ab,
+
+
+    draws_T = draws_T,
+
+
+    ranks = ranks,
+
+
+    sucra = sucra(ranks),
+
+
+    poth = poth(ranks),
+
+
+    mid = if (!is.null(mid)) mid else NA_real_
+
+
+  )
+
+
+  class(out) <- 'surro_fit'
+
+
+  out
+
+
+}
+
+
+
+
+
+# ---------------- Unified front-end ----------------
+
+
+#' @export
+
+
+surro_nma <- function(net,
+
+
+                      engine = c("bayes","freq"),
+
+
+                      inconsistency = c("none","random"),
+
+
+                      inc_on = c("T","S","both"),
+
+
+                      class_specific = TRUE,
+
+
+                      global_surrogacy = FALSE,
+
+
+                      use_t = FALSE,
+
+
+                      survival_mode = c("ph","nph_msplines"),
+
+
+                      bayes_method = c("mcmc","vi"),
+
+
+                      seed = 1, ...) {
+
+
+  engine <- match.arg(engine)
+
+
+  inconsistency <- match.arg(inconsistency)
+
+
+  inc_on <- match.arg(inc_on)
+
+
+  survival_mode <- match.arg(survival_mode)
+
+
+  if (engine=="bayes") {
+
+
+    do.call(surro_nma_bayes, c(list(net=net, inconsistency=inconsistency, inc_on=inc_on,
+
+
+                                    class_specific=class_specific, global_surrogacy=global_surrogacy,
+
+
+                                    use_t=use_t, survival_mode=survival_mode,
+
+
+                                    bayes_method=match.arg(bayes_method), seed=seed), list(...)))
+
+
+  } else {
+
+
+    do.call(surro_nma_freq, c(list(net=net, seed=seed), list(...)))
+
+
+  }
+
+
+}
+
+
+
+
+
+# ---------------- Summaries & prediction ----------------
+
+
+#' @export
+
+
+as_draws_T <- function(fit) {
+
+
+  if (fit$engine=="bayes") {
+
+
+    if (!requireNamespace("posterior", quietly = TRUE))
+
+
+      stop("posterior package required for Bayesian summaries")
+
+
+    dr <- fit$stan$draws(variables = paste0("dT[",1:fit$net$K,"]"))
+
+
+    posterior::as_draws_matrix(dr)
+
+
+  } else fit$draws_T
+
+
+}
+
+
+
+
+
+#' @export
+
+
+summarize_treatments <- function(fit, probs = c(.025,.5,.975)) {
+
+
+  D <- as_draws_T(fit)
+
+
+  trts <- fit$net$trt_levels
+
+
+  out <- t(apply(D, 2, function(x) c(mean=mean(x), stats::quantile(x, probs))))
+
+
+  colnames(out) <- c("mean", paste0(round(probs*100),"%"))
+
+
+  rownames(out) <- trts
+
+
+  as.data.frame(out)
+
+
+}
+
+
+
+
+
+#' @export
+
+
+compute_ranks <- function(fit, MID = NULL) {
+
+
+  D <- as_draws_T(fit)
+
+
+  if (!is.null(MID) && is.finite(MID)) {
+
+
+    ranks <- mid_adjusted_preference(D, MID = MID)
+
+
+  } else {
+
+
+    ranks <- rank_from_draws(D)
+
+
+  }
+
+
+  list(ranks=ranks, sucra=sucra(ranks), poth=poth(ranks))
+
+
+}
+
+
+
+
+
+# ---------------- Diagnostics ----------------
+
+
+#' @export
+
+
+surrogacy_diagnostics <- function(fit) {
+
+
+  out <- list()
+
+
+  if (fit$engine=="bayes") {
+
+
+    a0 <- fit$stan$draws("alpha0"); b0 <- fit$stan$draws("beta0")
+
+
+    alpha <- as.numeric(posterior::as_draws_matrix(a0)); beta <- as.numeric(posterior::as_draws_matrix(b0))
+
+
+    out$STE <- compute_STE(alpha, beta, threshold_T = 0)
+
+
+    out$alpha = c(mean=mean(alpha), q025=stats::quantile(alpha,.025), q975=stats::quantile(alpha,.975))
+
+
+    out$beta  = c(mean=mean(beta), q025=stats::quantile(beta,.025), q975=stats::quantile(beta,.975))
+
+
+  } else {
+
+
+    ab <- fit$deming
+
+
+    se_beta <- 0.2
+
+
+    draws_beta <- stats::rnorm(2000, ab["beta"], se_beta)
+
+
+    draws_alpha <- stats::rnorm(2000, ab["alpha"], 0.2)
+
+
+    out$STE <- compute_STE(draws_alpha, draws_beta, threshold_T=0)
+
+
+    out$alpha <- c(mean=ab["alpha"], q025=NA, q975=NA)
+
+
+    out$beta  <- c(mean=ab["beta"],  q025=NA, q975=NA)
+
+
+  }
+
+
+  class(out) <- "surro_diag"
+
+
+  out
+
+
+}
+
+
+
+
+
+#' @export
+
+
+stress_surrogacy <- function(fit, R2_mult = c(0.5, 0.7, 0.9), slope_shift = c(-0.1, 0,+0.1)) {
+
+
+  D <- as_draws_T(fit)
+
+
+  res <- list()
+
+
+  for (r2 in R2_mult) for (ss in slope_shift) {
+
+
+    M <- matrix(colMeans(D), nrow=nrow(D), ncol=ncol(D), byrow=TRUE)
+
+
+    D2 <- M + (D - M) * r2
+
+
+    res[[paste0("R2_",r2,"_SS_",ss)]] <- list(
+
+
+      sucra = sucra(rank_from_draws(D2)),
+
+
+      poth  = poth(rank_from_draws(D2))
+
+
+    )
+
+
+  }
+
+
+  res
+
+
+}
+
+
+
+
+
+# ---------------- Inconsistency ----------------
+
+
+#' @export
+
+
+nodesplit_pairs <- function(net) {
+
+
+  ab <- unique(t(apply(cbind(net$trt, net$comp), 1, function(x) sort(x))))
+
+
+  ab <- ab[!duplicated(ab), , drop=FALSE]
+
+
+  apply(ab, 1, function(x) c(a=x[1], b=x[2]))
+
+
+}
+
+
+
+
+
+#' @export
+
+
+nodesplit_analysis <- function(net, engine = c("bayes","freq"), pair = NULL, ...) {
+
+
+  engine <- match.arg(engine)
+
+
+  if (is.null(pair)) {
+
+
+    ps <- nodesplit_pairs(net)
+
+
+    if (length(ps) == 0) stop("No direct pairs for node-splitting.")
+
+
+    pair <- ps[,1]
+
+
+  }
+
+
+  a <- pair[1]; b <- pair[2]
+
+
+  sel_dir <- ( (net$trt==a & net$comp==b) | (net$trt==b & net$comp==a) )
+
+
+  if (!any(sel_dir)) stop("Selected pair has no direct comparisons.")
+
+
+  net_ind <- net
+
+
+  keep <- !sel_dir
+
+
+  net_ind$data    <- net$data[keep,,drop=FALSE]
+
+
+  net_ind$study   <- net$study[keep]
+
+
+  net_ind$trt     <- net$trt[keep]
+
+
+  net_ind$comp    <- net$comp[keep]
+
+
+  net_ind$S_eff   <- if(!is.null(net$S_eff)) net$S_eff[keep] else NULL
+
+
+  net_ind$S_se    <- if(!is.null(net$S_se))  net$S_se[keep]  else NULL
+
+
+  net_ind$T_eff   <- if(!is.null(net$T_eff)) net$T_eff[keep] else NULL
+
+
+  net_ind$T_se    <- if(!is.null(net$T_se))  net$T_se[keep]  else NULL
+
+
+  net_ind$corr_ST <- if(!is.null(net$corr_ST)) net$corr_ST[keep] else NULL
+
+
+  fit_ind <- surro_nma(net_ind, engine = engine, ...)
+
+
+  y <- net$T_eff[sel_dir]; s <- net$T_se[sel_dir]
+
+
+  W <- 1/pmax(s^2, 1e-9)
+
+
+  d_dir <- sum(y*W)/sum(W)
+
+
+  se_dir <- sqrt(1/sum(W))
+
+
+  D <- as_draws_T(fit_ind)
+
+
+  d_ind <- D[,a] - D[,b]
+
+
+  z <- (d_dir - mean(d_ind))/sqrt(se_dir^2 + stats::var(d_ind))
+
+
+  p <- 2*stats::pnorm(-abs(z))
+
+
+  list(pair=c(a=a,b=b), direct = c(est=d_dir, se=se_dir), indirect = c(mean=mean(d_ind), sd=stats::sd(d_ind)),
+
+
+       z=z, p=p)
+
+
+}
+
+
+
+
+
+#' @export
+
+
+global_inconsistency_test <- function(fit) {
+
+
+  net <- fit$net
+
+
+  ab <- nodesplit_pairs(net)
+
+
+  if (length(ab)==0) return(list(stat=NA, df=0, p=NA))
+
+
+  stats <- vapply(seq_len(ncol(ab)), function(i){
+
+
+    ns <- nodesplit_analysis(net, engine = fit$engine, pair = ab[,i])
+
+
+    ns$z^2
+
+
+  }, numeric(1))
+
+
+  stat <- sum(stats); df <- length(stats)
+
+
+  p <- stats::pchisq(stat, df=df, lower.tail = FALSE)
+
+
+  list(stat=stat, df=df, p=p)
+
+
+}
+
+
+
+
+
+# ---------------- Plotting ----------------
+
+
+#' @export
+
+
+plot_surrogacy <- function(fit) {
+
+
+  .suro_require("ggplot2")
+
+
+  net <- fit$net
+
+
+  df <- data.frame(S=net$S_eff, T=net$T_eff, class=net$classes[net$trt_class_id[net$trt]])
+
+
+  df <- df[is.finite(df$S) & is.finite(df$T),]
+
+
+  ggplot2::ggplot(df, ggplot2::aes(S, T, color=class)) +
+
+
+    ggplot2::geom_point(alpha=.7) + ggplot2::geom_smooth(method="lm", se=TRUE) +
+
+
+    ggplot2::theme_minimal() + ggplot2::labs(title="Surrogacy scatter", x="Surrogate contrast", y="True contrast")
+
+
+}
+
+
+
+
+
+#' @export
+
+
+plot_rankogram <- function(fit) {
+
+
+  .suro_require("ggplot2")
+
+
+  D <- as_draws_T(fit)
+
+
+  R <- rank_from_draws(D)
+
+
+  K <- ncol(R)
+
+
+  P <- sapply(1:K, function(r) colMeans(R==r))
+
+
+  df <- data.frame(treatment = rep(fit$net$trt_levels, K),
+
+
+                   rank = rep(1:K, each=K),
+
+
+                   prob = as.vector(P))
+
+
+  ggplot2::ggplot(df, ggplot2::aes(x=factor(rank), y=prob, group=treatment))+
+
+
+    ggplot2::geom_line(alpha=.7)+ggplot2::geom_point()+
+
+
+    ggplot2::facet_wrap(~treatment)+ggplot2::theme_minimal()+
+
+
+    ggplot2::labs(title="Rankograms", x="Rank", y="Probability")
+
+
+}
+
+
+
+
+
+#' @export
+
+
+plot_networks <- function(net) {
+
+
+  if (!.suro_require("igraph")) { message("igraph not installed; printing edge list."); print(table(paste(net$trt, net$comp))); return(invisible(NULL)) }
+
+
+  g <- igraph::graph_from_data_frame(data.frame(A=net$trt_levels[net$trt], B=net$trt_levels[net$comp]), directed = FALSE)
+
+
+  plot(g, main="Network graph")
+
+
+}
+
+
+
+
+
+#' @export
+
+
+plot_rank_flip <- function(fit) {
+
+
+  .suro_require("ggplot2")
+
+
+  D <- as_draws_T(fit)
+
+
+  ranks_pred <- rank_from_draws(D)
+
+
+  net <- fit$net
+
+
+  obsT <- is.finite(net$T_eff)
+
+
+  K <- net$K
+
+
+  X <- matrix(0, nrow=sum(obsT), ncol=K-1)
+
+
+  for (i in seq_len(sum(obsT))) {
+
+
+    ii <- which(obsT)[i]
+
+
+    if (net$trt[ii]!=1) X[i, net$trt[ii]-1] <-  1
+
+
+    if (net$comp[ii]!=1)X[i, net$comp[ii]-1] <- -1
+
+
+  }
+
+
+  yT <- net$T_eff[obsT]; vT <- net$T_se[obsT]^2; W <- 1/pmax(vT,1e-9)
+
+
+  beta <- try(solve(t(X)%*%(W*X), t(X)%*%(W*yT)), silent=TRUE)
+
+
+  if (inherits(beta,"try-error")) beta <- MASS::ginv(t(X)%*%(W*X))%*%t(X)%*%(W*yT)
+
+
+  dT_naive <- c(0, as.numeric(beta))
+
+
+  Dnaive <- matrix(rep(dT_naive, each=nrow(D)), nrow=nrow(D))
+
+
+  ranks_naive <- rank_from_draws(Dnaive)
+
+
+  df <- data.frame(treatment = rep(net$trt_levels, 2),
+
+
+                   rank = c(colMeans(ranks_naive), colMeans(ranks_pred)),
+
+
+                   type = rep(c("Naive T-only","Surrogate-bridged T"), each=K))
+
+
+  ggplot2::ggplot(df, ggplot2::aes(x=treatment, y=rank, fill=type))+
+
+
+    ggplot2::geom_col(position="dodge") + ggplot2::theme_minimal() +
+
+
+    ggplot2::labs(title="Rank flip: naive T-only vs surrogate-bridged T", y="Mean rank (lower is better)")
+
+
+}
+
+
+
+
+
+#' @export
+
+
+plot_ste <- function(diag) {
+
+
+  .suro_require("ggplot2")
+
+
+  s <- diag$STE$ste
+
+
+  df <- data.frame(ste = s)
+
+
+  ggplot2::ggplot(df, ggplot2::aes(ste)) + ggplot2::geom_histogram(bins = 40) +
+
+
+    ggplot2::theme_minimal() + ggplot2::labs(title = "Surrogate Threshold Effect draws", x="STE (on S-scale)")
+
+
+}
+
+
+
+
+
+#' @export
+
+
+plot_stress_curves <- function(res) {
+
+
+  .suro_require("ggplot2")
+
+
+  labs <- names(res)
+
+
+  mats <- lapply(res, `[[`, "sucra")
+
+
+  df <- do.call(rbind, lapply(seq_along(mats), function(i)
+
+
+    data.frame(scenario=labs[i], treatment=names(mats[[i]]), SUCRA=mats[[i]])))
+
+
+  ggplot2::ggplot(df, ggplot2::aes(treatment, SUCRA, group=scenario)) +
+
+
+    ggplot2::geom_line(alpha=.6) + ggplot2::geom_point() +
+
+
+    ggplot2::facet_wrap(~scenario) + ggplot2::theme_minimal() +
+
+
+    ggplot2::labs(title="Stress test: SUCRA under surrogacy perturbations")
+
+
+}
+
+
+
+
+
+# ---------------- CINeMA export ----------------
+
+
+#' @export
+
+
+export_cinema <- function(fit, file = "cinema_outcome.csv") {
+
+
+  summ <- summarize_treatments(fit)
+
+
+  tx <- rownames(summ)
+
+
+  D <- as_draws_T(fit); mu <- colMeans(D)
+
+
+  pw <- expand.grid(tx, tx, stringsAsFactors = FALSE); names(pw) <- c("t1","t2")
+
+
+  pw <- pw[pw$t1 != pw$t2,]
+
+
+  get <- function(t1,t2) mu[which(tx==t1)] - mu[which(tx==t2)]
+
+
+  pw$diff_mean <- mapply(get, pw$t1, pw$t2)
+
+
+  utils::write.csv(pw, file, row.names = FALSE)
+
+
+  invisible(pw)
+
+
+}
+
+
+
+
+
+# ---------------- Posterior predictive ----------------
+
+
+#' @export
+
+
+posterior_predict <- function(fit) {
+
+
+  if (fit$engine!="bayes") stop("Bayesian fit required.")
+
+
+  mu <- posterior::as_draws_matrix(fit$stan$draws("muT_pred"))
+
+
+  list(muT_pred = mu, T_obs = fit$net$T_eff)
+
+
+}
+
+
+
+
+
+#' @export
+
+
+pp_check <- function(fit) {
+
+
+  .suro_require("ggplot2")
+
+
+  pp <- posterior_predict(fit)
+
+
+  mu <- rowMeans(pp$muT_pred, na.rm=TRUE)
+
+
+  df <- data.frame(pred = mu, obs = pp$T_obs)
+
+
+  ggplot2::ggplot(df[is.finite(df$obs),], ggplot2::aes(pred, obs)) +
+
+
+    ggplot2::geom_point() + ggplot2::geom_abline(color="red") + ggplot2::theme_minimal() +
+
+
+    ggplot2::labs(title="Posterior predictive check (T)", x="mean predicted contrast", y="observed T contrast")
+
+
+}
+
+
+
+
+
+# ---------------- Explain ----------------
+
+
+#' @export
+
+
+explain <- function(fit) {
+
+
+  cat("Engine:", fit$engine, "\n")
+
+
+  if (fit$engine=="bayes") {
+
+
+    summ <- fit$stan$summary(variables=c("alpha0","beta0","tauS","tauT","sigma_d"))
+
+
+    print(summ)
+
+
+    cat("Inconsistency:", fit$inconsistency, " on ", fit$inc_on, "\n")
+
+
+    cat("Method:", fit$bayes_method, "\n")
+
+
+  } else {
+
+
+    print(list(deming=fit$deming, sucra=fit$sucra, poth=fit$poth))
+
+
+  }
+
+
+  cat("Treatments:", paste(fit$net$trt_levels, collapse=", "), "\n")
+
+
+  if (!is.null(attr(fit$net, "has_SI")) && isTRUE(attr(fit$net, "has_SI")))
+
+
+    cat("Surrogate Index used (S_multi -> S_eff).\n")
+
+
+}
+
+
+
+
+
+# ---------------- Reporting ----------------
+
+
+#' @export
+
+
+export_report <- function(fit, file = "surroNMA_report.html",
+
+
+                          author = "Analyst", title = "surroNMA Analysis",
+
+
+                          format = c("html","pdf"),
+
+
+                          include_ppc = TRUE, include_nodesplit = TRUE) {
+
+
+  format <- match.arg(format)
+
+
+  .suro_require(c("rmarkdown","knitr","ggplot2"))
+
+
+  tmp <- tempfile(fileext = if (format=="html") ".Rmd" else ".qmd")
+
+
+  cat(file = tmp, sep = "\n",
+
+
+      "---",
+
+
+      paste0("title: '", title, "'"),
+
+
+      paste0("author: '", author, "'"),
+
+
+      paste0("format: ", if (format=="html") "html" else "pdf"),
+
+
+      "---",
+
+
+
+
+
+      "```{r setup, include=FALSE}
+
+
+knitr::opts_chunk$set(fig.width=7, fig.height=5, echo=FALSE, message=FALSE, warning=FALSE)
+
+
+library(ggplot2)
+
+
+```",
+
+
+
+
+
+      "## Overview
+
+
+This report was generated by **surroNMA**. It summarizes the surrogate-bridged NMA results, diagnostics, and plots.",
+
+
+
+
+
+      "## Treatments & Engine
+
+
+```{r}
+
+
+fit$engine
+
+
+fit$net$trt_levels
+
+
+```",
+
+
+
+
+
+      "## Summary of treatment effects on T (lower=better)
+
+
+```{r}
+
+
+print(summarize_treatments(fit))
+
+
+```",
+
+
+
+
+
+      "## Rankograms, SUCRA, POTH
+
+
+```{r}
+
+
+print(plot_rankogram(fit))
+
+
+rk <- compute_ranks(fit)
+
+
+rk$sucra
+
+
+rk$poth
+
+
+```",
+
+
+
+
+
+      "## Surrogacy scatter
+
+
+```{r}
+
+
+print(plot_surrogacy(fit))
+
+
+```",
+
+
+
+
+
+      "## Network
+
+
+```{r}
+
+
+plot_networks(fit$net)
+
+
+```",
+
+
+
+
+
+      if (isTRUE(include_ppc))
+
+
+        "## Posterior predictive check
+
+
+```{r}
+
+
+if (fit$engine=='bayes') print(pp_check(fit))
+
+
+```" else "",
+
+
+
+
+
+      "## Surrogacy diagnostics & STE
+
+
+```{r}
+
+
+dg <- surrogacy_diagnostics(fit)
+
+
+dg$alpha; dg$beta
+
+
+dg$STE$summary
+
+
+print(plot_ste(dg))
+
+
+```",
+
+
+
+
+
+      if (isTRUE(include_nodesplit))
+
+
+        "## Node-splitting (selected)
+
+
+```{r}
+
+
+try({
+
+
+  ps <- nodesplit_pairs(fit$net)
+
+
+  if (length(ps)>0) {
+
+
+    ns <- nodesplit_analysis(fit$net, engine = fit$engine, pair = ps[,1])
+
+
+    ns
+
+
+  }
+
+
+}, silent=TRUE)
+
+
+```" else "",
+
+
+
+
+
+      "## Stress testing (R2 and slope shifts)
+
+
+```{r}
+
+
+res <- stress_surrogacy(fit)
+
+
+print(plot_stress_curves(res))
+
+
+```"
+
+
+  )
+
+
+  rmarkdown::render(tmp, output_file = file, quiet = TRUE)
+
+
+  message("Report written to: ", normalizePath(file))
+
+
+  invisible(file)
+
+
+}
+
+
+
+
+
+# ---------------- GUIs ----------------
+
+
+#' @export
+
+
+surroNMA_gui_gw <- function() {
+
+
+  if (!.suro_require(c('gWidgets2','gWidgets2RGtk2'))) {
+
+
+    message('gWidgets2/RGtk2 not found; falling back to Tcl/Tk basic GUI.')
+
+
+    if (exists('surroNMA_gui_tcltk', mode = 'function')) return(surroNMA_gui_tcltk())
+
+
+    message('Basic Tcl/Tk GUI not available.')
+
+
+    return(invisible(NULL))
+
+
+  }
+
+
+  options(guiToolkit = 'RGtk2')
+
+
+
+
+
+  w <- gWidgets2::gwindow('surroNMA v1.0', visible = TRUE)
+
+
+  nb <- gWidgets2::gnotebook(container = w)
+
+
+
+
+
+  # Data page
+
+
+  pg_data <- gWidgets2::ggroup(container = nb, label = 'Data')
+
+
+  fl <- gWidgets2::gframe('Load CSV', container = pg_data)
+
+
+  f_file <- gWidgets2::gfilebrowse(text = 'Choose CSV', type = 'open', container = fl)
+
+
+  gl <- gWidgets2::gformlayout(container = pg_data)
+
+
+  e_study <- gWidgets2::gedit('', label='study', container = gl)
+
+
+  e_trt   <- gWidgets2::gedit('', label='trt',   container = gl)
+
+
+  e_comp  <- gWidgets2::gedit('', label='comp',  container = gl)
+
+
+  e_S     <- gWidgets2::gedit('', label='S_eff (or leave blank)', container = gl)
+
+
+  e_Sse   <- gWidgets2::gedit('', label='S_se', container = gl)
+
+
+  e_T     <- gWidgets2::gedit('', label='T_eff', container = gl)
+
+
+  e_Tse   <- gWidgets2::gedit('', label='T_se', container = gl)
+
+
+  e_Smulti<- gWidgets2::gedit('', label='S_multi (comma-separated)', container = gl)
+
+
+  e_class <- gWidgets2::gedit('', label='class (optional)', container = gl)
+
+
+  e_corr  <- gWidgets2::gedit('', label='corr_ST (optional)', container = gl)
+
+
+  e_base  <- gWidgets2::gedit('', label='baseline_risk (optional)', container = gl)
+
+
+  e_rob   <- gWidgets2::gedit('', label='rob (optional)', container = gl)
+
+
+  btn_load <- gWidgets2::gbutton('Build network', container = pg_data)
+
+
+  net_env <- new.env(parent=emptyenv())
+
+
+
+
+
+  col_val <- function(x) { z <- gWidgets2::svalue(x); if (nzchar(z)) z else NULL }
+
+
+
+
+
+  gWidgets2::addHandlerChanged(btn_load, handler = function(h,...) {
+
+
+    fp <- gWidgets2::svalue(f_file); if (!nzchar(fp)) { gWidgets2::gmessage('Choose a CSV file'); return() }
+
+
+    df <- try(utils::read.csv(fp, check.names=FALSE), silent=TRUE)
+
+
+    if (inherits(df,'try-error')) { gWidgets2::gmessage('Could not read CSV'); return() }
+
+
+    Sm <- col_val(e_Smulti)
+
+
+    if (!is.null(Sm)) Sm <- trimws(strsplit(Sm, ',', fixed = TRUE)[[1]])
+
+
+    net <- try(surro_network(
+
+
+      data=df,
+
+
+      study = as.name(col_val(e_study)), trt=as.name(col_val(e_trt)), comp=as.name(col_val(e_comp)),
+
+
+      S_eff = if (!is.null(col_val(e_S)))   as.name(col_val(e_S))   else NULL,
+
+
+      S_se  = if (!is.null(col_val(e_Sse))) as.name(col_val(e_Sse)) else NULL,
+
+
+      T_eff = if (!is.null(col_val(e_T)))   as.name(col_val(e_T))   else NULL,
+
+
+      T_se  = if (!is.null(col_val(e_Tse))) as.name(col_val(e_Tse)) else NULL,
+
+
+      S_multi = Sm,
+
+
+      class = if (!is.null(col_val(e_class))) as.name(col_val(e_class)) else NULL,
+
+
+      corr_ST = if (!is.null(col_val(e_corr)))  as.name(col_val(e_corr))  else NULL,
+
+
+      baseline_risk = if (!is.null(col_val(e_base))) as.name(col_val(e_base)) else NULL,
+
+
+      rob = if (!is.null(col_val(e_rob))) as.name(col_val(e_rob)) else NULL
+
+
+    ), silent=TRUE)
+
+
+    if (inherits(net,'try-error')) { gWidgets2::gmessage(paste('Network build error:', as.character(net))); return() }
+
+
+    net_env$net <- net
+
+
+    gWidgets2::gmessage(paste0('Network built with treatments: ', paste(net$trt_levels, collapse=', ')))
+
+
+  })
+
+
+
+
+
+  # SI page
+
+
+  pg_si <- gWidgets2::ggroup(container = nb, label = "Surrogate Index")
+
+
+  gl2 <- gWidgets2::gformlayout(container = pg_si)
+
+
+  dd_si <- gWidgets2::gcombobox(c("none","ols","ridge","pcr","sl3"), label="SI method", container = gl2)
+
+
+  btn_si <- gWidgets2::gbutton("Train & apply SI", container = pg_si)
+
+
+  gWidgets2::addHandlerChanged(btn_si, handler = function(h,...) {
+
+
+    if (is.null(net_env$net)) { gWidgets2::gmessage("Load data first."); return() }
+
+
+    m <- gWidgets2::svalue(dd_si)
+
+
+    if (m=="none") { gWidgets2::gmessage("Skipping SI."); return() }
+
+
+    sm <- try(surro_index_train(net_env$net, method = m), silent=TRUE)
+
+
+    if (inherits(sm,"try-error")) { gWidgets2::gmessage("SI training failed"); return() }
+
+
+    net_env$net <- augment_network_with_SI(net_env$net, sm)
+
+
+    gWidgets2::gmessage("SI trained and applied.")
+
+
+  })
+
+
+
+
+
+  # Model page
+
+
+  pg_mod <- gWidgets2::ggroup(container = nb, label = "Model")
+
+
+  gl3 <- gWidgets2::gformlayout(container = pg_mod)
+
+
+  dd_engine <- gWidgets2::gcombobox(c("bayes","freq"), label="Engine", container = gl3)
+
+
+  dd_bayes  <- gWidgets2::gcombobox(c("mcmc","vi"), label="Bayes method", container = gl3)
+
+
+  dd_incon  <- gWidgets2::gcombobox(c("none","random"), label="Inconsistency", container = gl3)
+
+
+  dd_incon_on<- gWidgets2::gcombobox(c("T","S","both"), label="Inc on", container = gl3)
+
+
+  cb_class  <- gWidgets2::gcheckbox(text="Class-specific surrogacy", checked=TRUE, container = pg_mod)
+
+
+  cb_global <- gWidgets2::gcheckbox(text="Global surrogacy instead", checked=FALSE, container = pg_mod)
+
+
+  e_seed    <- gWidgets2::gedit("1", container = gl3, label="Seed")
+
+
+  btn_run   <- gWidgets2::gbutton("Run analysis", container = pg_mod)
+
+
+  logbox <- gWidgets2::gtext("", container = pg_mod, expand = TRUE, fill=TRUE)
+
+
+  fit_env <- new.env(parent=emptyenv())
+
+
+
+
+
+  gWidgets2::addHandlerChanged(btn_run, handler = function(h,...) {
+
+
+    if (is.null(net_env$net)) { gWidgets2::gmessage("Load data first."); return() }
+
+
+    cat("Running...\n", file = logbox)
+
+
+    flush.console()
+
+
+    fit <- try(surro_nma(
+
+
+      net_env$net,
+
+
+      engine = gWidgets2::svalue(dd_engine),
+
+
+      bayes_method = gWidgets2::svalue(dd_bayes),
+
+
+      inconsistency = gWidgets2::svalue(dd_incon),
+
+
+      inc_on = gWidgets2::svalue(dd_incon_on),
+
+
+      class_specific = gWidgets2::svalue(cb_class),
+
+
+      global_surrogacy = gWidgets2::svalue(cb_global),
+
+
+      seed = as.integer(gWidgets2::svalue(e_seed))
+
+
+    ), silent=TRUE)
+
+
+    if (inherits(fit,"try-error")) { gWidgets2::gmessage("Fit failed."); return() }
+
+
+    fit_env$fit <- fit
+
+
+    cat("Done.\n", file = logbox, append = TRUE)
+
+
+  })
+
+
+
+
+
+  # Results page
+
+
+  pg_res <- gWidgets2::ggroup(container = nb, label = "Results", horizontal = FALSE)
+
+
+  btn_summ <- gWidgets2::gbutton("Show summary table", container = pg_res)
+
+
+  tbl <- gWidgets2::gtable(data.frame(), container = pg_res, expand = TRUE, fill = TRUE)
+
+
+  gWidgets2::addHandlerClicked(btn_summ, handler = function(h,...) {
+
+
+    if (is.null(fit_env$fit)) { gWidgets2::gmessage("Run model first."); return() }
+
+
+    sm <- summarize_treatments(fit_env$fit)
+
+
+    tbl[] <- sm
+
+
+  })
+
+
+  btn_export <- gWidgets2::gbutton("Export CINeMA CSV", container = pg_res)
+
+
+  gWidgets2::addHandlerClicked(btn_export, handler = function(...) {
+
+
+    if (is.null(fit_env$fit)) { gWidgets2::gmessage("Run model first."); return() }
+
+
+    f <- gWidgets2::gfile("cinema.csv", type="save")
+
+
+    if (nzchar(f)) export_cinema(fit_env$fit, file = f)
+
+
+  })
+
+
+
+
+
+  # Plots page
+
+
+  pg_plot <- gWidgets2::ggroup(container = nb, label = "Plots", horizontal = FALSE)
+
+
+  btn_p1 <- gWidgets2::gbutton("Plot rankogram", container = pg_plot)
+
+
+  btn_p2 <- gWidgets2::gbutton("Plot surrogacy", container = pg_plot)
+
+
+  btn_p3 <- gWidgets2::gbutton("Plot network", container = pg_plot)
+
+
+  gWidgets2::addHandlerClicked(btn_p1, handler = function(...) if (!is.null(fit_env$fit)) print(plot_rankogram(fit_env$fit)))
+
+
+  gWidgets2::addHandlerClicked(btn_p2, handler = function(...) if (!is.null(fit_env$fit)) print(plot_surrogacy(fit_env$fit)))
+
+
+  gWidgets2::addHandlerClicked(btn_p3, handler = function(...) if (!is.null(net_env$net)) plot_networks(net_env$net))
+
+
+
+
+
+  # Diagnostics page
+
+
+  pg_diag <- gWidgets2::ggroup(container = nb, label = "Diagnostics", horizontal=FALSE)
+
+
+  btn_ppc <- gWidgets2::gbutton("PPC (Bayes only)", container = pg_diag)
+
+
+  gWidgets2::addHandlerClicked(btn_ppc, handler = function(...) if (!is.null(fit_env$fit) && fit_env$fit$engine=="bayes") print(pp_check(fit_env$fit)))
+
+
+  btn_ns  <- gWidgets2::gbutton("Node-splitting (first pair)", container = pg_diag)
+
+
+  gWidgets2::addHandlerClicked(btn_ns, handler = function(...) {
+
+
+    if (is.null(fit_env$fit)) { gWidgets2::gmessage("Run model first."); return() }
+
+
+    ns <- try(nodesplit_analysis(fit_env$fit$net, engine = fit_env$fit$engine), silent=TRUE)
+
+
+    print(ns)
+
+
+  })
+
+
+  btn_ste <- gWidgets2::gbutton("STE plot", container = pg_diag)
+
+
+  gWidgets2::addHandlerClicked(btn_ste, handler = function(...) if (!is.null(fit_env$fit)) print(plot_ste(surrogacy_diagnostics(fit_env$fit))))
+
+
+
+
+
+  # Report page
+
+
+  pg_rep <- gWidgets2::ggroup(container = nb, label = "Report")
+
+
+  e_author <- gWidgets2::gedit("Analyst", container = pg_rep)
+
+
+  e_title  <- gWidgets2::gedit("surroNMA Analysis", container = pg_rep)
+
+
+  dd_fmt   <- gWidgets2::gcombobox(c("html","pdf"), container = pg_rep)
+
+
+  btn_rep  <- gWidgets2::gbutton("Export report", container = pg_rep)
+
+
+  gWidgets2::addHandlerClicked(btn_rep, handler = function(...) {
+
+
+    if (is.null(fit_env$fit)) { gWidgets2::gmessage("Run model first."); return() }
+
+
+    f <- gWidgets2::gfile("surroNMA_report.html", type="save")
+
+
+    if (nzchar(f)) export_report(fit_env$fit, file = f,
+
+
+                                 author = gWidgets2::svalue(e_author),
+
+
+                                 title  = gWidgets2::svalue(e_title),
+
+
+                                 format = gWidgets2::svalue(dd_fmt))
+
+
+  })
+
+
+
+
+
+set_visible(w, TRUE)
+
+
+  invisible(list(window=w, net_env=net_env, fit_env=fit_env))
+
+
+}
+
+
+
+
+
+#' @export
+
+
+surroNMA_gui_tcltk <- function() {
+
+
+  if (!.suro_require("tcltk")) stop("No GUI toolkit available.")
+
+
+  tt <- tcltk::tktoplevel()
+
+
+  tcltk::tkwm.title(tt, "surroNMA (basic)")
+
+
+  tcltk::tkpack(tcltk::tklabel(tt, text="For the full GUI use gWidgets2 + RGtk2"))
+
+
+  invisible(tt)
+
+
+}
+
+
+
+
+
+# ---------------- Survival/IPD & causal hooks ----------------
+
+
+#' @export
+
+
+surro_ipd_prepare <- function(ipd) {
+
+
+  message("IPD survival hooks are placeholders in this package version. For full M-splines NPH survival, integrate IPD into Stan data.")
+
+
+  invisible(ipd)
+
+
+}
+
+
+
+
+
+#' @export
+
+
+surro_causal_checks <- function(ipd, dag = NULL) {
+
+
+  if (!.suro_require(c("tmle3","ggdag"))) {
+
+
+    message("tmle3/ggdag not installed or IPD not provided; skipping causal checks.")
+
+
+    return(invisible(NULL))
+
+
+  }
+
+
+  message("Implement TMLE-based principal surrogacy checks with IPD here.")
+
+
+  invisible(NULL)
+
+
+}
+
+
+
+
+
+# ---------------- Simulator ----------------
+
+
+#' @export
+
+
+simulate_surro_data <- function(K=5, J=20, per_study=1, alpha=0.0, beta=0.8, tauS=0.2, tauT=0.3,
+
+
+                                sigma_d=0.4, classes = NULL, seed=1) {
+
+
+  set.seed(seed)
+
+
+  if (is.null(classes)) classes <- paste0("C", seq_len(K))
+
+
+  trts <- paste0("T", seq_len(K))
+
+
+  n <- J*per_study
+
+
+  A <- sample(trts, n, TRUE); B <- sample(trts, n, TRUE)
+
+
+  B[B==A] <- sample(trts[trts!=A[which(B==A)]], sum(B==A), TRUE)
+
+
+  study <- rep(seq_len(J), each=per_study)
+
+
+  dS <- c(0, stats::rnorm(K-1, 0, 0.3))
+
+
+  dT <- c(0, stats::rnorm(K-1, 0, 0.3))
+
+
+  uS <- stats::rnorm(J, 0, tauS)
+
+
+  uT <- stats::rnorm(J, 0, tauT)
+
+
+  map <- setNames(seq_len(K), trts)
+
+
+  s_eff <- (dS[map[A]] - dS[map[B]]) + uS[study] + stats::rnorm(n, 0, 0.1)
+
+
+  s_se  <- rep(0.1, n)
+
+
+  t_obs <- stats::rbinom(n, 1, 0.7)==1
+
+
+  t_mu  <- (alpha + beta * ((dS[map[A]] - dS[map[B]]) + uS[study])) + stats::rnorm(n, 0, sigma_d)
+
+
+  t_eff <- ifelse(t_obs, t_mu + stats::rnorm(n,0,0.15), NA_real_)
+
+
+  t_se  <- ifelse(t_obs, 0.15, NA_real_)
+
+
+  data.frame(study=study, trt=A, comp=B,
+
+
+             logHR_S=s_eff, se_S=s_se,
+
+
+             logHR_T=t_eff, se_T=t_se,
+
+
+             class=sample(classes, n, TRUE))
+
+
+}
+
+
+
+
+
+
+
+
+
+
+
+set_visible <- function(obj, value) {
+
+
+  # Call gWidgets2's replacement function visible<- without creating an 'f<-' symbol
+
+
+  setter <- utils::getFromNamespace("visible<-", "gWidgets2")
+
+
+  # replacement functions have signature (x, value); do.call avoids parse-time f<- NOTE
+
+
+  do.call(setter, list(obj, value))
+
+
+  invisible(obj)
+
+
+}
+
+
+
+
+
